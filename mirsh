@@ -1,0 +1,920 @@
+#!/usr/bin/env python
+
+from sshtunnel import SSHTunnelForwarder
+from xml.dom import minidom
+from time import sleep
+import subprocess
+import string
+import random
+import os
+import stat
+import logging
+import time
+import multiprocessing as mp
+import orderedset
+import libvirt
+# import pprint
+import sys
+import argparse
+from tabulate import tabulate
+
+### Vars Start ###
+
+kvmhosts_file = '/etc/kvmhosts'
+
+vm_attr_list = ['host', 'id', 'ostype', 'uuid', 'autostart', 'cputotaltime',
+                'cpuusertime', 'cpusystemtime', 'hascurrentsnapshot',
+                'hasmanagedsaveimage', 'maxmem', 'mem', 'vcpu', 'maxvcpu',
+                'persistent', 'updated', 'jobinfo', 'jobstats', 'name',
+                'numaparams', 'snapshots', 'state']
+vm_attr_list_default = 'host,id,name,state'
+host_attr_list = ['host', 'virtlibversion', 'cpumap', 'cpustats', 'freemem',
+                  'hostname', 'cpumodel', 'mem', 'cpus', 'mhz', 'nodes',
+                  'cpusockets', 'cpucores', 'corethreads', 'memparams',
+                  'memstats', 'type', 'uri', 'version', 'inactivevms',
+                  'activevms']
+host_attr_list_default = 'host,mem,freemem,cpus,inactivevms,activevms'
+# vm_do_actions are commands that a vm can do to itself without further info or
+# sub-actions. The action (subcommand) name is just passed directly to the vm
+# with vm_do()
+vm_do_actions = ['vm-shutdown', 'vm-destroy', 'vm-suspend', 'vm-resume', 'vm-undefine',
+                 'vm-start', 'vm-reset', 'vm-reboot', 'vm-dumpxml', 'vm-edit',
+                 'vm-autostart', 'vm-noautostart', 'vm-vncdisplay', 'vm-printvncdisplay']
+
+### Vars End   ###
+
+### Classes Start ###
+
+
+class Pool:
+    pools = {}
+
+    def __init__(self, name, filename, conntype, verbose):
+        self.name = name  # okay
+        self.hosts = []
+        if verbose >= 3:
+            print '[Pool]: Initializing Pool instance "%s". Pool.pools: "%s".' % (name, Pool.pools)
+        with open(filename) as f:
+            self.hosts.extend([Host(x.strip(), conntype, verbose) for x in f.readlines()])
+        Pool.pools[name] = self
+
+    def vm_do(self, h, v, a, dryrun, verbose, kvmhostfile):
+        for host in self.hosts:
+            if host.name == h:
+                return host.vm_do(v, a, dryrun, verbose, kvmhostfile)
+        return "Host not found"
+
+    def vm_define(self, h, xml, dryrun, verbose):
+        for host in self.hosts:
+            if host.name == h:
+                return host.vm_define(xml, dryrun, verbose)
+        return "Host not found"
+
+    def host_list(self, fields, query, order):
+        rows = []
+        for host in self.hosts:
+            outercontinue = False
+            if query:
+                for f in host_attr_list:
+                    if f in query and str(query[f]) != str(host.getattr(f)):
+                        outercontinue = True
+                        continue
+            if outercontinue: continue
+            row = host.getattrs(fields)
+            rows.append(row)
+        if order in fields:
+            sortkey = fields.index(order)
+            rows = sorted(rows, key=lambda r: r[sortkey])
+        return rows
+
+    def vm_list(self, fields, query, order):
+        rows = []
+        for host in self.hosts:
+            rows.extend(host.vm_list(fields, query))
+        if order in fields:
+            sortkey = fields.index(order)
+            rows = sorted(rows, key=lambda r: r[sortkey])
+        return rows
+
+    def vm_getattr(self, attr, h, vm, verbose):
+        for host in self.hosts:
+            if host.name == h:
+                return host.vm_getattr(attr, vm, verbose)
+        return "not found"
+
+    def vm_migrate(self, srchost, srcvm, dsthost, dryrun, verbose, kvmhostfile):
+        for host in self.hosts:
+            if host.name == srchost:
+                if verbose >= 3:
+                    print '[Pool "%s"]: Found host "%s", telling it to migrate vm "%s" to host "%s".' % (self.name, srchost, srcvm, dsthost)
+                return host.vm_migrate(srchost, srcvm, dsthost, dryrun, verbose, kvmhostfile)
+        sys.exit('[Pool "%s"]: Error: Can\'t find source host "%s".' % (self.name, srchost))
+
+    def vm_jobinfo(self, h, vm, verbose):
+        for host in self.hosts:
+            if host.name == h:
+                return host.vm_jobinfo(vm, verbose)
+        return {'type': -1, 'state': 'not found'}
+
+
+class Host:
+    def __init__(self, name, conntype, verbose):
+        self.name = name
+        self.vms = []
+        uri = "qemu+ssh://root@%s/system" % name
+        if verbose >= 2: print '[Host "%s"]: Creating %s connection to host with uri "%s"...' % (name, conntype, uri)
+        try:
+            if conntype == "rw":
+                self.connection = libvirt.open(uri)
+            else:
+                self.connection = libvirt.openReadOnly(uri)
+            if verbose >= 2: print '[Host "%s"]: Connected to host successfully.' % name
+        except:
+            if verbose >= 2: print '[Host "%s"]: Failed connecting to host.' % name
+            return
+        for domain in self.connection.listAllDomains():
+            self.vms.extend([Vm(self.connection, domain)])
+
+    def vm_do(self, v, a, dryrun, verbose, kvmhostfile):
+        if verbose >= 2:
+            print '[Host "%s"]: Gonna send action "%s" to vm "%s".' % (self.name, a, v)
+        for vm in self.vms:
+            if vm.domain.name() == v:
+                return vm.do(self.name, a, dryrun, verbose, kvmhostfile)
+        return 'Can\'t find vm'
+
+    def vm_define(self, xml, dryrun, verbose):
+        if verbose >= 2:
+            print '[Host "%s"]: Gonna define a new vm from xml.' % self.name
+        if verbose >= 3:
+            print '[Host "%s"]: XML:\n%s' % (self.name, xml)
+        if dryrun:
+            print '[Host "%s"]: Dry run, no action taken.' % self.name
+            return 0
+        else:
+            return self.connection.defineXML(xml)
+
+    def vm_migrate(self, srchost, srcvm, dsthost, dryrun, verbose, kvmhostfile):
+        if verbose >= 3:
+            print '[Host "%s"]: Gonna tell vm "%s" to migrate itself to host "%s".' % (self.name, srcvm, dsthost)
+        for vm in self.vms:
+            if vm.domain.name() == srcvm:
+                return vm.migrate(srchost, srcvm, dsthost, dryrun, verbose, kvmhostfile)
+        sys.exit('[Host "%s"]: Error: Can\'t find vm "%s".' % (self.name, srcvm))
+
+    def vm_getattr(self, attr, local_vm, verbose):
+        for vm in self.vms:
+            if vm.domain.name() == local_vm:
+                return vm.getattr(attr, self.name)
+        return "not found"
+
+    def vm_jobinfo(self, v, verbose):
+        for vm in self.vms:
+            if vm.domain.name() == v:
+                return vm.jobinfo(verbose)
+        return {'type': -1, 'state': 'not found'}
+
+    def getattrs(self, host_list_fields):
+        values = []
+        for field in host_list_fields:
+            values.append(self.getattr(field))
+        return values
+
+    def getattr(self, attrname):
+        if attrname == 'host':
+            return self.name
+        elif attrname == 'cpumap':
+            return self.connection.getCPUMap()
+        elif attrname == 'cpustats':
+            return self.connection.getCPUStats(-1)
+        elif attrname == 'freemem':
+            return self.connection.getFreeMemory()
+        elif attrname == 'cpumodel':
+            return self.connection.getInfo()[0]
+        elif attrname == 'mem':
+            return self.connection.getInfo()[1]
+        elif attrname == 'cpus':
+            return self.connection.getInfo()[2]
+        elif attrname == 'mhz':
+            return self.connection.getInfo()[3]
+        elif attrname == 'nodes':
+            return self.connection.getInfo()[4]
+        elif attrname == 'cpusockets':
+            return self.connection.getInfo()[5]
+        elif attrname == 'cpucores':
+            return self.connection.getInfo()[6]
+        elif attrname == 'corethreads':
+            return self.connection.getInfo()[7]
+        elif attrname == 'memparams':
+            return self.connection.getMemoryParameters()
+        elif attrname == 'memstats':
+            return self.connection.getMemoryStats(-1)
+        elif attrname == 'type':
+            return self.connection.getType()
+        elif attrname == 'uri':
+            return self.connection.getURI()
+        elif attrname == 'version':
+            return self.connection.getVersion()
+        elif attrname == 'inactivevms':
+            return self.connection.numOfDefinedDomains()
+        elif attrname == 'activevms':
+            return self.connection.numOfDomains()
+        elif attrname == 'libvirtversion':
+            return self.connection.getLibVersion()
+        elif attrname == 'hostname':
+            return self.connection.getHostname()
+        else:
+            return ''
+
+    def vm_list(self, fields, query):
+        rows = []
+        for vm in self.vms:
+            outercontinue = False
+            if query:
+                for f in vm_attr_list:
+                    if f in query and str(query[f]) != str(vm.getattr(f, self.name)):
+                        outercontinue = True
+                        continue
+            if outercontinue: continue
+            row = vm.getattrs(fields, self.name)
+            rows.append(row)
+        return rows
+
+
+class Vm:
+    def __init__(self, conn, domain):
+        self.domain = domain
+
+    def migrate(self, srchost, srcvm, dsthost, dryrun, verbose, kvmhostfile):
+        # dsturi = pool.findhost("name", args.dsthost).getattr('uri')
+        dsturi = "qemu+ssh://root@%s/system" % dsthost
+        if verbose >= 1:
+            print '[Vm "%s"]: Migrating myself from host "%s" to host "%s" with uri "%s"...' % (self.domain.name(), srchost, dsthost, dsturi)
+        if dryrun:
+            print '[Vm "%s"]: No action taken since this is a dry run.' % self.domain.name()
+            state = self.domain.info()[0]
+            result = 0
+        else:
+            # Check state: self.domain.info()[0]
+            state = self.domain.info()[0]
+            if state in (1, 3):
+                # State is in ("running", "paused"): Doing live migration
+                result = self.domain.migrateToURI(dsturi, 2079)
+            elif state == 5:
+                # State is "shutdown": Doing define/undefine
+                xml = self.domain.XMLDesc(11)
+                vm_define(dsthost, xml, dryrun, verbose, kvmhostfile)
+                vm_do(srchost, srcvm, 'vm-undefine', kvmhostfile, dryrun, verbose)
+                result = 0
+            else:
+                sys.exit('[Vm "%s"]: Error: VM is in state "%s" which is not yet supported for migration.' % (self.domain.name(), self.getattr('state', srchost)))
+        return result
+
+    def do(self, h, a, dryrun, verbose, kvmhostfile):
+        if verbose >= 2: print '[Vm "%s"]: Got action "%s".' % (self.domain.name(), a)
+        if dryrun:
+            print '[Vm "%s"]: Doing nothing since this is a dry run.' % self.domain.name()
+            return 0
+        else:
+            if a == 'vm-shutdown':
+                if verbose >= 1: print '[Vm "%s"]: Shutting down.' % self.domain.name()
+                return self.domain.shutdown()
+            elif a == 'vm-destroy':
+                if verbose >= 1: print '[Vm "%s"]: Destroying.' % self.domain.name()
+                return self.domain.destroy()
+            elif a == 'vm-suspend':
+                if verbose >= 1: print '[Vm "%s"]: Suspending.' % self.domain.name()
+                return self.domain.suspend()
+            elif a == 'vm-resume':
+                if verbose >= 1: print '[Vm "%s"]: Suspending.' % self.domain.name()
+                return self.domain.resume()
+            elif a == 'vm-undefine':
+                if verbose >= 1: print '[Vm "%s"]: Undefining.' % self.domain.name()
+                return self.domain.undefine()
+            elif a == 'vm-start':
+                if verbose >= 1: print '[Vm "%s"]: Starting.' % self.domain.name()
+                return self.domain.create()
+            elif a == 'vm-reset':
+                if verbose >= 1: print '[Vm "%s"]: Reseting.' % self.domain.name()
+                return self.domain.reset()
+            elif a == 'vm-reboot':
+                if verbose >= 1: print '[Vm "%s"]: Rebooting.' % self.domain.name()
+                return self.domain.reboot()
+            elif a == 'vm-dumpxml':
+                if verbose >= 1: print '[Vm "%s"]: Dumping XML.' % self.domain.name()
+                xml = self.domain.XMLDesc(11)
+                if xml:
+                    print xml
+                    return 0
+                else:
+                    return -1
+            elif a == 'vm-edit':
+                if verbose >= 1: print '[Vm "%s"]: Editing XML on host "%s".' % (self.domain.name(), h)
+                editor = get_editor()
+                xml = self.domain.XMLDesc(3)
+                randomtag = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.lowercase + string.digits) for _ in range(6))
+                tempfilename = '/tmp/mirsh%s.xml' % randomtag
+                print "Editor: %s, randomtag: %s, tempfilename: %s" % (editor, randomtag, tempfilename)
+                xmlfile = open(tempfilename, 'w')
+                xmlfile.write(xml)
+                xmlfile.close()
+                os.system('%s %s' % (editor, tempfilename))
+                xmlfile = open(tempfilename, 'r')
+                newxml = xmlfile.read()
+                if xml == newxml:
+                    sys.exit('XML configuration of vm "%s" not changed' % self.domain.name())
+                return vm_define(h, newxml, dryrun, verbose, kvmhostfile)
+            elif a == 'vm-autostart':
+                if verbose >= 1: print '[Vm "%s"]: Setting autostart.' % self.domain.name()
+                return self.domain.setAutostart(1)
+            elif a == 'vm-noautostart':
+                if verbose >= 1: print '[Vm "%s"]: Setting no autostart.' % self.domain.name()
+                return self.domain.setAutostart(0)
+            elif a == 'vm-vncdisplay':
+                if verbose >= 1: print '[Vm "%s"]: Connecting to vncdisplay.' % self.domain.name()
+                xml = self.domain.XMLDesc(0)
+                xmldoc = minidom.parseString(xml)
+                graphics = xmldoc.getElementsByTagName('devices')[0].getElementsByTagName('graphics')[0]
+                if graphics.getAttribute("type") != "vnc":
+                    sys.exit('Graphics type "%s" is not supported' % graphics.getAttribute("type"))
+                port = int(graphics.getAttribute("port"))
+                address = graphics.getAttribute("listen")
+                tunnel = SSHTunnelForwarder((h, 22), remote_bind_address=(address, port),
+                                            ssh_username='root', ssh_private_key='%s/.ssh/id_rsa' % os.environ.get('HOME'),
+                                            raise_exception_if_any_forwarder_have_a_problem=False)
+                tunnel.start()
+                lport = tunnel.local_bind_port
+                cmd = ['vncviewer', '%s:%s' % (address, lport)]
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+                process.wait()
+                if verbose >= 1: print '[Vm "%s"]: Connecting vncviewer to localhost:%s -> %s:%s.' % (self.domain.name(), lport, h, port)
+                sleep(3)
+                try:
+                    tunnel.stop()
+                except:
+                    pass
+                return "blaaa"
+            elif a == 'vm-printvncdisplay':
+                if verbose >= 1: print '[Vm "%s"]: Printing vncdisplay address and port.' % self.domain.name()
+                xml = self.domain.XMLDesc(0)
+                xmldoc = minidom.parseString(xml)
+                graphics = xmldoc.getElementsByTagName('devices')[0].getElementsByTagName('graphics')[0]
+                if graphics.getAttribute("type") != "vnc":
+                    sys.exit('Graphics type "%s" is not supported' % graphics.getAttribute("type"))
+                port = graphics.getAttribute("port")
+                address = graphics.getAttribute("listen")
+                return "%s:%s" % (address, port)
+            else:
+                return -1
+        sys.exit('[Vm "%s"]: Error: Unknown action: "%s".' % (self.domain.name(), a))
+
+    def jobinfo(self, verbose):
+        try:
+            stats = self.domain.jobStats()
+        except libvirt.libvirtError:
+            stats = {'type': -1, 'state': 'not found'}
+        return stats
+
+    def getattrs(self, vm_list_fields, host_name):
+        values = []
+        for field in vm_list_fields:
+            values.append(self.getattr(field, host_name))
+        return values
+
+    def getattr(self, attrname, host_name):
+        # host_name (and possibly future extra arguments) are passed so that
+        # this method can answer queries on fields it doesn't know about.
+        if attrname == 'id':
+            return self.domain.ID()
+        if attrname == 'host':
+            return host_name
+        elif attrname == 'ostype':
+            return self.domain.OSType()
+        elif attrname == 'uuid':
+            return self.domain.UUIDString()
+        elif attrname == 'autostart':
+            return ('yes' if self.domain.autostart() else 'no')
+        elif attrname == 'cputotaltime':
+            if self.domain.info()[0] in [1, 2, 4]:
+                return self.domain.getCPUStats(1)[0]['cpu_time']
+            else:
+                return 'N/A'
+        elif attrname == 'cpuusertime':
+            if self.domain.info()[0] in [1, 2, 4]:
+                return self.domain.getCPUStats(1)[0]['user_time']
+            else:
+                return 'N/A'
+        elif attrname == 'cpusystemtime':
+            if self.domain.info()[0] in [1, 2, 4]:
+                return self.domain.getCPUStats(1)[0]['system_time']
+            else:
+                return 'N/A'
+        elif attrname == 'hascurrentsnapshot':
+            return ('yes' if self.domain.hasCurrentSnapshot() else 'no')
+        elif attrname == 'hasmanagedsave':
+            return ('yes' if self.domain.hasManagedSaveImage() else 'no')
+        elif attrname == 'maxmem':
+            return self.domain.info()[1]
+        elif attrname == 'mem':
+            return self.domain.info()[2]
+        elif attrname == 'vcpu':
+            return self.domain.info()[3]
+        elif attrname == 'persistent':
+            return ('yes' if self.domain.isPersistent() else 'no')
+        elif attrname == 'updated':
+            return ('yes' if self.domain.isUpdated() else 'no')
+        elif attrname == 'jobinfo':
+            if self.domain.info()[0] in [1, 2, 4]:
+                return self.domain.jobInfo()
+            else:
+                return 'N/A'
+        elif attrname == 'jobstats':
+            if self.domain.info()[0] in [1, 2, 4]:
+                return self.domain.jobStats()
+            else:
+                return 'N/A'
+        elif attrname == 'maxvcpu':
+            if self.domain.info()[0] in [1, 2, 4]:
+                return self.domain.maxVcpus()
+            else:
+                return 'N/A'
+        elif attrname == 'name':
+            return self.domain.name()
+        elif attrname == 'numaparams':
+            return self.domain.numaParameters()
+        elif attrname == 'snapshots':
+            return self.domain.snapshotNum()
+        elif attrname == 'state':
+            states = {0: 'none', 1: 'running', 2: 'blocked', 3: 'paused', 4: 'stopping', 5: 'stopped', 6: 'crashed', 7: 'suspended'}
+            return "%s(%s)" % (states.get(self.domain.info()[0], 'unknown'), self.domain.info()[0])
+        else:
+            return ''
+
+
+### Classes End   ###
+
+
+### Subs Start ###
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Multi-vIRSH tool - Manage multiple virsh-kvm hosts', epilog='To get help for specific commands use "mirsh <subcommand> --help"')
+    #
+    # Subparsers
+    subparsers = parser.add_subparsers(dest='action', help="Sub Commands. Run \"<subcommand> --help\" for help on specific sub command options", description="Sub commands")
+    #
+    # vm-list subparser
+    parser_vm_list = subparsers.add_parser('vm-list', help="List virtual machines")
+    parser_vm_list.add_argument("-f", "--fields", help="comma seperated (no spaces please) list of fields (Default: %s)" % vm_attr_list_default, action="store", default=vm_attr_list_default)
+    parser_vm_list.add_argument("-q", "--query", help="comma seperated (no spaces please) list of field queries (i.e.: -q host=kvmhost1,state=running(1))", action="store")
+    parser_vm_list.add_argument("-o", "--order", help="field to order by. Ignored if illegal of not in \"fields\".", action="store")
+    parser_vm_list.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_list.add_argument("-H", "--no-header", help="don't print table header", action="store_true")
+    parser_vm_list.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-list-fields subparser
+    parser_vm_list_fields = subparsers.add_parser('vm-list-fields', help="Print available fields for listing virtual machines")
+    parser_vm_list_fields.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    #
+    # vm-shutdown subparser
+    parser_vm_shutdown = subparsers.add_parser('vm-shutdown', help="Gracefully shutdown a vm (Request shutdown from guest OS)")
+    parser_vm_shutdown.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_shutdown.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_shutdown.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_shutdown.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-destroy subparser
+    parser_vm_destroy = subparsers.add_parser('vm-destroy', help="Destroy a vm (virtual power plug pull)")
+    parser_vm_destroy.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_destroy.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_destroy.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_destroy.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-suspend subparser
+    parser_vm_suspend = subparsers.add_parser('vm-suspend', help="Suspend (pause) a vm")
+    parser_vm_suspend.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_suspend.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_suspend.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_suspend.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-resume subparser
+    parser_vm_resume = subparsers.add_parser('vm-resume', help="Resume (unsuspend) a vm")
+    parser_vm_resume.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_resume.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_resume.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_resume.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-start subparser
+    parser_vm_start = subparsers.add_parser('vm-start', help="Start a previously defined vm")
+    parser_vm_start.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_start.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_start.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_start.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-reset subparser
+    parser_vm_reset = subparsers.add_parser('vm-reset', help="Reset a vm (virtual power cycle")
+    parser_vm_reset.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_reset.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_reset.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_reset.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-reboot subparser
+    parser_vm_reboot = subparsers.add_parser('vm-reboot', help="Reboot a vm (Request restart from guest OS)", epilog='Note: This action depends on many factors (VM settings, agent existance, ACPI settings on guest OS, etc.) to function properly. For further info read about "virsh reboot".')
+    parser_vm_reboot.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_reboot.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_reboot.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_reboot.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-dumpxml subparser
+    parser_vm_dumpxml = subparsers.add_parser('vm-dumpxml', help="Dump vm xml (with flags: migratable, inactive, security-information)")
+    parser_vm_dumpxml.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_dumpxml.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_dumpxml.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_dumpxml.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-undefine subparser
+    parser_vm_undefine = subparsers.add_parser('vm-undefine', help="Undefine a vm")
+    parser_vm_undefine.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_undefine.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_undefine.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_undefine.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-define subparser
+    parser_vm_define = subparsers.add_parser('vm-define', help="Define (but don't start) a vm from xml")
+    parser_vm_define.add_argument("host", help="Host to define the vm on", action="store")
+    parser_vm_define.add_argument("xmlfile", metavar="file", nargs="?", help="File containing an XML domain description", action="store", default=sys.stdin)
+    parser_vm_define.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_define.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_define.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-create subparser
+    parser_vm_create = subparsers.add_parser('vm-create', help="Define and start a vm from xml")
+    parser_vm_create.add_argument("host", help="Host to create the vm on", action="store")
+    parser_vm_create.add_argument("xmlfile", metavar="file", nargs="?", help="File containing an XML domain description", action="store", default=sys.stdin)
+    parser_vm_create.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_create.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_create.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-edit subparser
+    parser_vm_edit = subparsers.add_parser('vm-edit', help="Edit XML configuration of a vm")
+    parser_vm_edit.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_edit.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_edit.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_edit.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-autostart subparser
+    parser_vm_autostart = subparsers.add_parser('vm-autostart', help="Set a vm to autostart")
+    parser_vm_autostart.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_autostart.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_autostart.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_autostart.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-noautostart subparser
+    parser_vm_noautostart = subparsers.add_parser('vm-noautostart', help="Set a vm to NOT autostart")
+    parser_vm_noautostart.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_noautostart.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_noautostart.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_noautostart.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-vncdisplay subparser
+    parser_vm_vncdisplay = subparsers.add_parser('vm-vncdisplay', help="Open vncdisplay to vm")
+    parser_vm_vncdisplay.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_vncdisplay.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_vncdisplay.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_vncdisplay.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-printvncdisplay subparser
+    parser_vm_printvncdisplay = subparsers.add_parser('vm-printvncdisplay', help="Print vncdisplay of vm")
+    parser_vm_printvncdisplay.add_argument("vm", help="VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_printvncdisplay.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_printvncdisplay.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_printvncdisplay.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # vm-migrate subparser
+    parser_vm_migrate = subparsers.add_parser('vm-migrate', help="Migrate a vm to another host")
+    parser_vm_migrate.add_argument("fullsrcvm", metavar="SRC-VM", help="Source VM in either full form: <hostname>/<vmname> or in short form: <vmname> (short form will only work if it's unique across hosts)", action="store")
+    parser_vm_migrate.add_argument("dsthost", metavar="DST-Host", help="Destination Host to migrate VM to", action="store")
+    parser_vm_migrate.add_argument("-p", "--progress", help="show progress", action="store_true")
+    parser_vm_migrate.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_vm_migrate.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_vm_migrate.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # host-list subparser
+    parser_host_list = subparsers.add_parser('host-list', help="List hosts")
+    parser_host_list.add_argument("-f", "--fields", help="comma seperated (no spaces please) list of fields (Default: %s)" % host_attr_list_default, action="store", default=host_attr_list_default)
+    parser_host_list.add_argument("-q", "--query", help="comma seperated (no spaces please) list of field queries (i.e.: -q host=kvmhost1,type=QEMU)", action="store")
+    parser_host_list.add_argument("-o", "--order", help="field to order by. Ignored if illegal of not in \"fields\".", action="store")
+    parser_host_list.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_host_list.add_argument("-H", "--no-header", help="don't print table header", action="store_true")
+    parser_host_list.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    #
+    # host-list-fields subparser
+    parser_host_list_fields = subparsers.add_parser('host-list-fields', help="Print available fields for listing hosts")
+    parser_host_list_fields.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    #
+    # host-evacuate subparser
+    parser_host_evacuate = subparsers.add_parser('host-evacuate', help="Evacuate a host by migrating all of it's vms to other hosts")
+    parser_host_evacuate.add_argument("host", help="Host to evacuate", action="store")
+    parser_host_evacuate.add_argument("-c", "--max-concurrency", help="Maximum vms to migrate simultaniously. (Default: 2)", action="store", default=2, type=int)
+    parser_host_evacuate.add_argument("-p", "--progress", help="show progress", action="store_true")
+    parser_host_evacuate.add_argument("-n", "--dry-run", help="dry run (will not actually do anything)", action="store_true")
+    parser_host_evacuate.add_argument("-v", "--verbose", help="verbosity level. Can be specified more than once", action="count", default=0)
+    parser_host_evacuate.add_argument("-k", "--kvm-host-file", help="kvm host file location. Specify path to file containing kvm hosts each on a new line. (Default: '/etc/kvmhosts')", default="/etc/kvmhosts", metavar="filename")
+    return parser.parse_args()
+
+
+def vm_list(args):
+    if args.verbose >= 2: print "[Main/vm_list]: Printing vm list."
+    pool = pool_init("pool", args.kvm_host_file, "ro", args.verbose)
+    rows = pool.vm_list(args.fields, args.query, args.order)
+    tableprint(rows, args.fields, args.no_header)
+
+
+def host_list(args):
+    if args.verbose >= 2: print "[Main/host_list]: Printing host list."
+    pool = pool_init("pool", args.kvm_host_file, "ro", args.verbose)
+    rows = pool.host_list(args.fields, args.query, args.order)
+    tableprint(rows, args.fields, args.no_header)
+
+
+def tableprint(rows, fields, no_header_flag):
+    if no_header_flag:
+        print tabulate(rows, tablefmt="plain")
+    else:
+        print tabulate(rows, headers=map(lambda x: x.upper(), fields))
+
+
+def args_postprocess(args):
+    try:
+        args.fields = args.fields.split(',')
+        args.fields = list(orderedset.OrderedSet(args.fields))    # Remove duplicates from fields list
+        args.query = args.query.split(',')
+        args.query = list(orderedset.OrderedSet(args.query))    # Remove duplicates from query list
+        args.query = dict(q.split('=') for q in args.query)
+    except:
+        pass
+    # if args.verbose >= 2: print "%s started with arguments: %s\nArgs parsed as: %s" % (sys.argv.pop(0), ' '.join(sys.argv), args)
+    if args.action == 'vm-list':
+        if args.fields == ['all']: args.fields = vm_attr_list
+        for field in args.fields:
+            if field not in vm_attr_list: sys.exit('[Main/args_postprocess]: Error: Field "%s" is not supported. Please use subcommand "vm-list-fields" see available fields.' % field)
+    elif args.action == 'host-list':
+        if args.fields == ['all']: args.fields = host_attr_list
+        for field in args.fields:
+            if field not in host_attr_list: sys.exit('[Main/args_postprocess]: Error: Field "%s" is not supported. Please use subcommand "host-list-fields" to see available fields.' % field)
+    elif args.action == 'vm-migrate':
+        (args.srchost, args.srcvm) = args_expand_vmname(args.fullsrcvm, args.kvm_host_file, args.dry_run, args.verbose)
+    elif args.action in ['vm-suspend', 'vm-resume', 'vm-edit']:
+        (args.host, args.vm) = args_expand_vmname(args.vm, args.kvm_host_file, args.dry_run, args.verbose)
+    elif args.action in vm_do_actions:
+        (args.host, args.vm) = args_expand_vmname(args.vm, args.kvm_host_file, args.dry_run, args.verbose)
+    return args
+
+
+def args_expand_vmname(vmname, kvmhostfile, dryrun, verbose):
+    if '/' in vmname:
+        (host, vm) = vmname.split('/')
+    else:
+        vm = vmname
+        host = vm_find_host(vm, kvmhostfile, dryrun, verbose)
+    return (host, vm)
+
+
+def vm_do(host, vm, action, kvmhostfile, dryrun, verbose):
+    if verbose >= 2: print '[Main/vm_do]: sending action "%s" to vm "%s" on host "%s".' % (action, vm, host)
+    pool = pool_init("pool-%s-%s-%s" % (action, host, vm), kvmhostfile, "rw", verbose)
+    return pool.vm_do(host, vm, action, dryrun, verbose, kvmhostfile)
+
+
+def vm_create_from_file(host, xmlfile, kvm_host_file, dryrun, verbose):
+    if type(xmlfile) is str:
+        xmlfile = open(xmlfile)
+    mode = os.fstat(xmlfile.fileno()).st_mode
+    # Check if it's normal file or pipe. We don't want interactive use input.
+    if stat.S_ISFIFO(mode) or stat.S_ISREG(mode):
+        xml = xmlfile.read()
+        try:
+            xmldoc = minidom.parseString(xml)
+            vmname = xmldoc.getElementsByTagName('name')[0].childNodes[0].nodeValue
+        except:
+            sys.exit('Invalid XML encountered')
+        if vm_define(host, xml, dryrun, verbose, kvm_host_file):
+            return vm_do(host, vmname, 'vm-start', kvm_host_file, dryrun, verbose)
+        else:
+            return 1
+    else:
+        sys.exit('[Main/vm_create_from_file] Error: XML file should be passed as either argument or stdin')
+
+
+def get_editor():
+    return (os.environ.get("VISUAL") or
+            os.environ.get("EDITOR") or
+            "vi")
+
+
+def vm_define_from_file(host, xmlfile, kvm_host_file, dryrun, verbose):
+    if type(xmlfile) is str:
+        xmlfile = open(xmlfile)
+    mode = os.fstat(xmlfile.fileno()).st_mode
+    if stat.S_ISFIFO(mode) or stat.S_ISREG(mode):
+        xml = xmlfile.read()
+        if vm_define(host, xml, dryrun, verbose, kvm_host_file):
+            return 0
+        else:
+            return 1
+    else:
+        sys.exit('[Main/vm_define_from_file] Error: XML file should be passed as either argument or stdin')
+
+
+def vm_define(host, xml, dryrun, verbose, kvmhostfile):
+    try:
+        xmldoc = minidom.parseString(xml)
+        vmname = xmldoc.getElementsByTagName('name')[0].childNodes[0].nodeValue
+    except:
+        sys.exit('Invalid XML encountered')
+    if verbose >= 2: print '[Main/vm_define]: defining a vm "%s" on host "%s".' % (vmname, host)
+    if verbose >= 3: print '[Main/vm_define]: XML: "%s".' % (xml)
+    pool = pool_init("pool-define-%s-%s" % (host, vmname), kvmhostfile, "rw", verbose)
+    return pool.vm_define(host, xml, dryrun, verbose)
+
+
+def vm_migrate(srchost, srcvm, dsthost, dryrun, verbose, kvmhostfile):
+    if verbose >= 2: print '[Main/vm_migrate]: Migrating vm "%s" from host "%s" to host "%s".' % (srcvm, srchost, dsthost)
+    if srchost == dsthost:
+        sys.exit('[Main/vm_migrate]: Error: Source host and destination host are the same.')
+    if srchost == '':
+        sys.exit('[Main/vm_migrate]: Error: No suitable source host. Use full SRC-VM form.')
+    pool = pool_init("pool-%s-%s" % (srchost, srcvm), kvmhostfile, "rw", verbose)
+    return pool.vm_migrate(srchost, srcvm, dsthost, dryrun, verbose, kvmhostfile)
+
+
+def vm_jobinfo(host, vm, kvmhostfile, verbose):
+    pool = pool_init("pool", kvmhostfile, "rw", verbose)
+    return pool.vm_jobinfo(host, vm, verbose)
+
+
+# TODO: Move to Pool.somefactoryfunc or __init__
+def pool_init(name, kvmhostfile, type, verbose):
+    if name in Pool.pools:
+        return Pool.pools[name]
+    else:
+        return Pool(name, kvmhostfile, type, verbose)
+
+
+def vm_getattr(attr, host, vm, kvmhostfile, verbose):
+    pool = pool_init("pool", kvmhostfile, "ro", verbose)
+    if attr == "pool": return pool
+    return pool.vm_getattr(attr, host, vm, verbose)
+
+
+def vm_find_host(vm, kvmhostfile, dryrun, verbose):
+    pool = pool_init("pooltmp", kvmhostfile, "ro", verbose)
+    suspected_hosts = pool.vm_list(['host'], {'name': vm}, False)
+    suspected_hosts = [val for sublist in suspected_hosts for val in sublist]  # Flat magic
+    if len(suspected_hosts) == 1:
+        host = suspected_hosts[0]
+        if verbose >= 3: print '[Main/vm_find_host]: Found vm "%s" on host "%s"' % (vm, host)
+    elif len(suspected_hosts) == 0:
+        if verbose >= 1: print '[Main/vm_find_host]: Error: Couldn\'t find vm "%s" on any host' % vm
+        host = ''
+    elif len(suspected_hosts) > 1:
+        if verbose >= 1: print '[Main/vm_find_host]: Error: vm "%s" exist on more than one host. Please use the full source vm format (<hostname>/<vmname>).' % vm
+        host = ''
+    return host
+
+
+def multi_vm_migrate(verbose, migrations, kvmhostfile, concurrency):
+    total_exitcode = 0
+    tasks = []
+    # Populate tasks
+    for mig in migrations:  # TODO Make sure we are migrating only running(1) and think about what to do with offline migrations
+        if verbose >= 2: print '[Main/multi_vm_migrate]: Creating migration task with details: "%s"' % mig
+        task = mp.Process(target=vm_migrate,
+                          args=(mig['srchost'], mig['srcvm'], mig['dsthost'], mig['dryrun'], mig['verbose'], mig['kvmhostfile']),
+                          name="migrate-%s/%s-to-%s" % (mig['srchost'], mig['srcvm'], mig['dsthost']))
+        tasks.append({'task': task, 'mig': mig})
+        # task.start()
+    if verbose >= 2: print '[Main/multi_vm_migrate]: Done creating migration tasks.'
+    # Monitor (and start) tasks untill all are done
+    while True:
+        tasksalive = 0
+        for task in tasks:
+            if task['task'].is_alive():
+                status = "active"
+            elif task['task'].pid is None:
+                status = "waiting"
+            else:
+                status = "done"
+            if status == "waiting" and tasksalive < concurrency:
+                task['task'].start()
+                status = "active"
+            statsline = '[Main/multi_vm_migrate]: Task "%s" is %s.' % (task['task'].name, status)
+            if status == "active":
+                tasksalive += 1
+                jobinfo = vm_jobinfo(task['mig']['srchost'], task['mig']['srcvm'], task['mig']['kvmhostfile'], task['mig']['verbose'])
+                if verbose >= 3:
+                    statsline += "\tPool Obj is %s" % vm_getattr('pool', task['mig']['dsthost'], task['mig']['srcvm'], task['mig']['kvmhostfile'], task['mig']['verbose'])
+                if jobinfo['type'] == 2:
+                    if jobinfo['memory_total'] > 0:
+                        memtransferred = 100 - (jobinfo['memory_remaining'] / float(jobinfo['memory_total']) * 100)
+                        statsline += "\tMemory transferred:\t%.2f%%" % memtransferred
+                    if jobinfo['disk_total'] > 0:
+                        disktransferred = 100 - (jobinfo['disk_remaining'] / float(jobinfo['disk_total']) * 100)
+                        statsline += "\tDisk transferred:\t%.2f%%" % disktransferred
+                if jobinfo['type'] == -1:
+                    # print "jobinfo type is now %s, state is now %s" % (jobinfo['type'], jobinfo['state'])
+                    if jobinfo['state'] == "running(1)":
+                        statsline += "\tMigration havn't started yet"
+                    if jobinfo['state'] == "paused(3)":
+                        statsline += "\tvm is paused"
+                    if jobinfo['state'] == "not found":
+                        statsline += "\tvm is undefined at source host."
+                        statsline += "\tvm is at state %s at destination host." % vm_getattr('state', task['mig']['dsthost'], task['mig']['srcvm'], task['mig']['kvmhostfile'], task['mig']['verbose'])
+            elif status == "done":
+                statsline += "\t\tExit code: %s" % task['task'].exitcode
+                if task['task'].exitcode != 0: total_exitcode = 1
+            if task['mig']['progress']: print statsline
+        if task['mig']['progress'] and len(tasks) > 1: print "---"
+        time.sleep(1)
+        if tasksalive == 0:
+            tasksok = [task['task'].exitcode for task in tasks].count(0)
+            if verbose >= 1: print '[Main/multi_vm_migrate]: All tasks are done: %s OK / %s Error' % (tasksok, len(tasks) - tasksok)
+            return total_exitcode
+
+
+def host_evacuate(host, kvmhostfile, progress, dryrun, verbose, concurrency):
+    migrations = []
+    if verbose >= 1: print '[Main/host_evacuate]: Migrating all vms from host "%s"' % host
+    pool = pool_init("pooltmp", kvmhostfile, "ro", verbose)
+    vms = pool.vm_list(['name', 'mem'], {'host': host}, False)
+    hosts = pool.host_list(['host', 'freemem'], False, False)
+    for h in hosts:
+        if h[0] == host:
+            hosts.remove(h)
+    for vm in vms:
+        if verbose >= 3: print '[Main/host_evacuate]: Searching for destination host for vm "%s"' % vm[0]
+        maxfreemem = 0
+        for h in hosts:
+            if h[1] > maxfreemem:
+                dsthostindex = hosts.index(h)
+                maxfreemem = h[1]
+        hosts[dsthostindex][1] -= vm[1] * 1024
+        if hosts[dsthostindex][1] < 0:
+            sys.exit('[Main/host_evacuate]: Error: Not enough free memoryon other hosts')
+        if verbose >= 1: print '[Main/host_evacuate]: vm "%s" will be migrated to host "%s"' % (vm[0], hosts[dsthostindex][0])
+        migrations.append({'srchost': host,
+                           'srcvm': vm[0],
+                           'dsthost': hosts[dsthostindex][0],
+                           'dryrun': dryrun,
+                           'verbose': verbose,
+                           'progress': progress,
+                           'kvmhostfile': kvmhostfile})
+    exitcode = multi_vm_migrate(verbose, migrations, kvmhostfile, concurrency)
+    return exitcode
+
+
+def libvirt_callback(ignore, err):
+    if err[3] != libvirt.VIR_ERR_ERROR:
+        logging.warn("Non-error from libvirt: '%s'" % err[2])
+
+
+### Subs End   ###
+
+### Main Start ###
+
+
+def main():
+    # Make libvirterrors silent if catched
+    libvirt.registerErrorHandler(f=libvirt_callback, ctx=None)
+    args = parse_args()
+    args = args_postprocess(args)
+    if args.action == "vm-list":
+        vm_list(args)
+    elif args.action == 'vm-list-fields':
+        print "Available fields are:\n%s" % vm_attr_list
+    elif args.action in vm_do_actions:
+        exitcode = vm_do(args.host, args.vm, args.action, args.kvm_host_file, args.dry_run, args.verbose)
+        sys.exit(exitcode)
+    elif args.action == 'vm-migrate':
+        exitcode = multi_vm_migrate(args.verbose, [{'srchost': args.srchost, 'srcvm': args.srcvm, 'dsthost': args.dsthost, 'dryrun': args.dry_run, 'verbose': args.verbose, 'progress': args.progress, 'kvmhostfile': args.kvm_host_file}], kvmhosts_file, 1)
+        sys.exit(exitcode)
+    elif args.action == "host-list":
+        host_list(args)
+    elif args.action == 'host-list-fields':
+        print "Available fields are:\n%s" % host_attr_list
+    elif args.action == 'host-evacuate':
+        exitcode = host_evacuate(args.host, args.kvm_host_file, args.progress, args.dry_run, args.verbose, args.max_concurrency)
+        sys.exit(exitcode)
+    elif args.action == 'vm-define':
+        exitcode = vm_define_from_file(args.host, args.xmlfile, args.kvm_host_file, args.dry_run, args.verbose)
+        sys.exit(exitcode)
+    elif args.action == 'vm-create':
+        exitcode = vm_create_from_file(args.host, args.xmlfile, args.kvm_host_file, args.dry_run, args.verbose)
+        sys.exit(exitcode)
+    else:
+        print "No sub command specified. Exiting."
+
+if __name__ == '__main__':
+    main()
+
+### Main End   ###
